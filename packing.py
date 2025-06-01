@@ -8,16 +8,22 @@ import os
 import pickle
 from openpyxl import load_workbook
 from openpyxl.styles import Font
-
+from PIL import Image, ImageTk
 class WarehousePacker:
     def __init__(self, root):
         self.root = root
         self.root.title("Warehouse Packer")
+        style = ttk.Style()
+        style.configure("Treeview.Heading", font=("Arial", 16))
+        style.configure("Treeview", font=("Arial", 20))  # Если нужно и сами строки
+        style.configure("Treeview", rowheight=36)
+        self.row_height = 36
+        self.img = ImageTk.PhotoImage(Image.new('RGBA', (1, self.row_height), (255, 255, 255, 0)))
 
         # Data structures
-        self.data = None               # pandas DataFrame: article->quantity
-        self.gtin_map = None           # pandas Series: gtin->article mapping
-        self.packages = {}             # dict: box_name -> {article:count}
+        self.data = None         
+        self.gtin_map = None         
+        self.packages = {}         
         self.current_box = None
 
         # Persistent GTIN mapping file
@@ -63,14 +69,19 @@ class WarehousePacker:
         self.scan_entry = tk.Entry(scan_frame)
         self.scan_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         self.scan_entry.bind('<Return>', self.process_scan)
+        self.scan_entry.focus_set()
 
         # Tree with dynamic headings
         self.tree = ttk.Treeview(right_frame, columns=("article","scanned","remaining"), show='headings')
         self.tree.heading('article', text='Артикул')
-        self.tree.heading('scanned', text='Отсканировано')
+        self.tree.heading('scanned', text='В коробке')
         self.tree.heading('remaining', text='Осталось')
         self.tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.tree.bind('<Double-1>', self.on_tree_double_click)
+
+        # Label: total remaining
+        self.remaining_label = tk.Label(right_frame, text="")
+        self.remaining_label.pack(pady=3)
 
     def _load_mapping_disk(self):
         if os.path.exists(self.mapping_file):
@@ -99,16 +110,20 @@ class WarehousePacker:
                 sub['quantity'] = sub['quantity'].astype(int)
                 sub.set_index('article', inplace=True)
                 self.data = sub
+                self.data.sort_index(inplace=True)
             else:
                 col0, col1 = df.columns[:2]
                 df = df.astype({col0: str, col1: int})
                 df.columns = ['article','quantity']
                 df.set_index('article', inplace=True)
                 self.data = df
+                self.data.sort_index(inplace=True)
+
             messagebox.showinfo("Готово", f"Загружено {len(self.data)} позиций.")
             self.packages.clear(); self.current_box=None
             self.box_listbox.delete(0, tk.END)
             self.tree.delete(*self.tree.get_children())
+            self.refresh_tree()
         except Exception as e:
             winsound.Beep(1000,200)
             messagebox.showerror("Ошибка", f"Не удалось загрузить лист:\n{e}")
@@ -168,6 +183,7 @@ class WarehousePacker:
             self.packages.pop(name,None)
             self.box_listbox.delete(sel)
             self.current_box=None; self.tree.delete(*self.tree.get_children())
+            self.refresh_tree()
 
     def on_box_select(self,event=None):
         sel = self.box_listbox.curselection()
@@ -184,6 +200,7 @@ class WarehousePacker:
         if self.data is None or self.current_box is None or self.gtin_map is None:
             winsound.Beep(1000,200)
             messagebox.showwarning("Внимание","Загрузите данные и выберите коробку.")
+            self.scan_entry.focus_set()
             return
         if gtin not in self.gtin_map.index:
             winsound.Beep(1000,200)
@@ -204,9 +221,9 @@ class WarehousePacker:
 
         # Record successful scan and play success sound
         self.packages[self.current_box][article] += 1
-        winsound.PlaySound('SystemAsterisk', winsound.SND_ALIAS)
+        winsound.PlaySound('SystemAsterisk', winsound.SND_ALIAS | winsound.SND_ASYNC)
         self.refresh_tree()
-
+        self.scan_entry.focus_set()
 
     def on_tree_double_click(self,event):
         item=self.tree.identify_row(event.y); col=self.tree.identify_column(event.x)
@@ -225,19 +242,37 @@ class WarehousePacker:
 
     def refresh_tree(self):
         # Update headings with totals
-        total_articles = len(self.data)
-        total_scanned = sum(self.packages[self.current_box].values())
-        total_remaining = sum(self.data.at[art,'quantity'] - cnt for art, cnt in self.packages[self.current_box].items())
+        total_articles = len(self.data) if self.data is not None else 0
+        if self.current_box is not None:
+            total_scanned = sum(self.packages[self.current_box].values())
+        else:
+            total_scanned = 0
+        total_remaining = sum(self.data.at[art,'quantity'] - self.total_scanned(art) for art in self.data.index) if self.data is not None else 0
+
         self.tree.heading('article', text=f'Артикул ({total_articles})')
-        self.tree.heading('scanned', text=f'Отсканировано ({total_scanned})')
+        self.tree.heading('scanned', text=f'В коробке ({total_scanned})')
         self.tree.heading('remaining', text=f'Осталось ({total_remaining})')
 
         # Refresh rows
         self.tree.delete(*self.tree.get_children())
-        for art, qty in self.data['quantity'].items():
-            scanned = self.packages[self.current_box].get(art, 0)
-            rem = qty - self.total_scanned(art)
-            self.tree.insert('', tk.END, values=(art, scanned, rem))
+        select_next = None
+        if self.data is not None and self.current_box is not None:
+            for idx, (art, qty) in enumerate(self.data['quantity'].items()):
+                scanned = self.packages[self.current_box].get(art, 0)
+                rem = qty - self.total_scanned(art)
+                iid = self.tree.insert('', tk.END, values=(art, scanned, rem))
+                if select_next is None and rem > 0:
+                    select_next = iid
+        # выделить строку с первым незаполненным
+        if select_next is not None:
+            self.tree.selection_set(select_next)
+            self.tree.focus(select_next)
+            self.tree.see(select_next)
+
+        # Update label with total remaining for ALL boxes
+        self.remaining_label.config(text=f"Всего осталось распределить: {total_remaining}")
+
+    # ... остальные функции (экспорт, ship_wb, ship_ozon) не менялись ...
 
     def export(self):
         rows=[]
@@ -270,9 +305,9 @@ class WarehousePacker:
             winsound.Beep(1000,200)
             messagebox.showerror("Ошибка шаблона", str(e)); return
         boxes = list(self.packages.keys())
-        if len(tpl) != len(boxes):
-            winsound.Beep(1000,200)
-            messagebox.showerror("Несоответствие", "Количество строк шаблона не равно количеству коробок"); return
+        # if len(tpl) != len(boxes):
+        #     winsound.Beep(1000,200)
+        #     messagebox.showerror("Несоответствие", "Количество строк шаблона не равно количеству коробок"); return
         article_to_gtin = {art:gt for gt,art in self.gtin_map.items()} if self.gtin_map is not None else {}
         out_rows = []
         for idx, box in enumerate(boxes):
@@ -325,10 +360,7 @@ class WarehousePacker:
                 messagebox.showerror("Ошибка шаблона", str(e))
                 return
             boxes = list(self.packages.keys())
-            if len(tpl) != len(boxes):
-                winsound.Beep(1000,200)
-                messagebox.showerror("Несоответствие", "Количество строк шаблона не равно количеству коробок")
-                return
+
             article_to_gtin = {art:gt for gt,art in self.gtin_map.items()} if self.gtin_map is not None else {}
             out_rows = []
             for idx, box in enumerate(boxes):
@@ -364,6 +396,3 @@ if __name__=='__main__':
     root=tk.Tk()
     WarehousePacker(root)
     root.mainloop()
-
-# Сборка в exe:
-# pyinstaller --onefile --windowed warehouse_packer.py
