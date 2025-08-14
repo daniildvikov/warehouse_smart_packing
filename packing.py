@@ -9,13 +9,22 @@ import pickle
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 from PIL import Image, ImageTk
+
+# Импортируем модуль склада
+try:
+    from warehouse_storage import WarehouseStorage
+    STORAGE_AVAILABLE = True
+except ImportError:
+    STORAGE_AVAILABLE = False
+    print("Модуль склада недоступен. Установите необходимые зависимости.")
+
 class WarehousePacker:
     def __init__(self, root):
         self.root = root
         self.root.title("Warehouse Packer")
         style = ttk.Style()
         style.configure("Treeview.Heading", font=("Arial", 16))
-        style.configure("Treeview", font=("Arial", 20))  # Если нужно и сами строки
+        style.configure("Treeview", font=("Arial", 18))
         style.configure("Treeview", rowheight=36)
         self.row_height = 36
         self.img = ImageTk.PhotoImage(Image.new('RGBA', (1, self.row_height), (255, 255, 255, 0)))
@@ -25,6 +34,9 @@ class WarehousePacker:
         self.gtin_map = None         
         self.packages = {}         
         self.current_box = None
+
+        # Инициализация модуля склада
+        self.storage = WarehouseStorage(root) if STORAGE_AVAILABLE else None
 
         # Persistent GTIN mapping file
         self.mapping_file = os.path.expanduser('~/.warehouse_packer_gtin.pkl')
@@ -44,7 +56,7 @@ class WarehousePacker:
         btn_frame = tk.Frame(box_frame)
         btn_frame.pack(pady=5)
         for text, cmd in [("Добавить", self.add_box), ("Переименовать", self.rename_box), ("Удалить", self.delete_box)]:
-            tk.Button(btn_frame, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text=text, command=cmd).pack(side=tk.LEFT, padx=2)
 
         # Right panel: controls and tree
         right_frame = tk.Frame(main_frame)
@@ -52,16 +64,33 @@ class WarehousePacker:
 
         toolbar = tk.Frame(right_frame)
         toolbar.pack(fill=tk.X, pady=5)
-        actions = [
+        
+        # Первый ряд кнопок
+        toolbar1 = tk.Frame(toolbar)
+        toolbar1.pack(fill=tk.X)
+        actions1 = [
             ("Загрузить лист", self.load_sheet),
             ("Загрузить GTIN", self.load_gtin_map),
             ("Скачать шаблон", self.download_template),
+        ]
+        for text, cmd in actions1:
+            tk.Button(toolbar1, text=text, command=cmd).pack(side=tk.LEFT, padx=3)
+        
+        # Второй ряд кнопок
+        toolbar2 = tk.Frame(toolbar)
+        toolbar2.pack(fill=tk.X, pady=(5,0))
+        actions2 = [
             ("Экспорт", self.export),
             ("Отгрузка WB", self.ship_wb),
             ("Отгрузка Ozon", self.ship_ozon)
         ]
-        for text, cmd in actions:
-            tk.Button(toolbar, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
+        for text, cmd in actions2:
+            tk.Button(toolbar2, text=text, command=cmd).pack(side=tk.LEFT, padx=3)
+        
+        # Кнопка управления складом
+        if self.storage:
+            tk.Button(toolbar2, text="Собственный склад", 
+                     command=self.storage.show_storage_window).pack(side=tk.LEFT, padx=3)
 
         scan_frame = tk.Frame(right_frame)
         scan_frame.pack(fill=tk.X, pady=5)
@@ -71,11 +100,28 @@ class WarehousePacker:
         self.scan_entry.bind('<Return>', self.process_scan)
         self.scan_entry.focus_set()
 
-        # Tree with dynamic headings
-        self.tree = ttk.Treeview(right_frame, columns=("article","scanned","remaining"), show='headings')
-        self.tree.heading('article', text='Артикул')
-        self.tree.heading('scanned', text='В коробке')
-        self.tree.heading('remaining', text='Осталось')
+        # Tree with dynamic headings - добавляем колонку для ячейки
+        if self.storage and self.storage.enabled:
+            columns = ("article","scanned","remaining","cell")
+            self.tree = ttk.Treeview(right_frame, columns=columns, show='headings')
+            self.tree.heading('article', text='Артикул')
+            self.tree.heading('scanned', text='В коробке')
+            self.tree.heading('remaining', text='Осталось')
+            self.tree.heading('cell', text='Ячейка')
+            self.tree.column('article', width=200)
+            self.tree.column('scanned', width=100)
+            self.tree.column('remaining', width=100)
+            self.tree.column('cell', width=100)
+        else:
+            columns = ("article","scanned","remaining")
+            self.tree = ttk.Treeview(right_frame, columns=columns, show='headings')
+            self.tree.heading('article', text='Артикул')
+            self.tree.heading('scanned', text='В коробке')
+            self.tree.heading('remaining', text='Осталось')
+            self.tree.column('article', width=300)
+            self.tree.column('scanned', width=120)
+            self.tree.column('remaining', width=120)
+        
         self.tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.tree.bind('<Double-1>', self.on_tree_double_click)
 
@@ -219,6 +265,19 @@ class WarehousePacker:
             messagebox.showerror("Превышено", f"Доступно {allowed}, использовано {used}")
             return
 
+        # Проверяем наличие на складе
+        if self.storage and self.storage.enabled:
+            storage_qty, storage_cell = self.storage.get_article_info(article)
+            if storage_qty is not None and storage_qty <= 0:
+                winsound.Beep(1000,200)
+                messagebox.showwarning("Недостаточно на складе", 
+                                     f"Товар {article} отсутствует на складе")
+                return
+            
+            # Уменьшаем количество на складе
+            self.storage.update_article_quantity(article, -1)
+            self.storage.save_storage_data()
+
         # Record successful scan and play success sound
         self.packages[self.current_box][article] += 1
         winsound.PlaySound('SystemAsterisk', winsound.SND_ALIAS | winsound.SND_ASYNC)
@@ -228,8 +287,9 @@ class WarehousePacker:
     def on_tree_double_click(self,event):
         item=self.tree.identify_row(event.y); col=self.tree.identify_column(event.x)
         if not item or col!='#2': return
-        art, scanned, _= self.tree.item(item,'values')
-        new_val=simpledialog.askinteger("Редактировать","Новое количество:", initialvalue=int(scanned), minvalue=0)
+        art, scanned, remaining = self.tree.item(item,'values')[:3]
+        new_val=simpledialog.askinteger("Редактировать","Новое количество:", 
+                                       initialvalue=int(scanned), minvalue=0)
         if new_val is None: return
         allowed=self.data.at[art,'quantity']
         other=self.total_scanned(art)-int(scanned)
@@ -237,17 +297,57 @@ class WarehousePacker:
             winsound.Beep(1000,200)
             messagebox.showerror("Превышено", f"Всего доступно {allowed}, в других коробках {other}")
             return
+        
+        # Обновляем склад при изменении количества
+        if self.storage and self.storage.enabled:
+            difference = int(scanned) - new_val  # Разница: положительная = возвращаем на склад
+            if difference != 0:
+                self.storage.update_article_quantity(art, difference)
+                self.storage.save_storage_data()
+        
         self.packages[self.current_box][art]=new_val
         self.refresh_tree()
 
     def refresh_tree(self):
+        # Определяем, нужно ли показывать колонку с ячейками
+        show_cells = self.storage and self.storage.enabled
+        
+        # Обновляем структуру дерева если нужно
+        current_columns = self.tree['columns']
+        needed_columns = ("article","scanned","remaining","cell") if show_cells else ("article","scanned","remaining")
+        
+        if current_columns != needed_columns:
+            self.tree.destroy()
+            if show_cells:
+                self.tree = ttk.Treeview(self.tree.master, columns=needed_columns, show='headings')
+                self.tree.heading('article', text='Артикул')
+                self.tree.heading('scanned', text='В коробке')
+                self.tree.heading('remaining', text='Осталось')
+                self.tree.heading('cell', text='Ячейка')
+                self.tree.column('article', width=200)
+                self.tree.column('scanned', width=100)
+                self.tree.column('remaining', width=100)
+                self.tree.column('cell', width=100)
+            else:
+                self.tree = ttk.Treeview(self.tree.master, columns=needed_columns, show='headings')
+                self.tree.heading('article', text='Артикул')
+                self.tree.heading('scanned', text='В коробке')
+                self.tree.heading('remaining', text='Осталось')
+                self.tree.column('article', width=300)
+                self.tree.column('scanned', width=120)
+                self.tree.column('remaining', width=120)
+            
+            self.tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            self.tree.bind('<Double-1>', self.on_tree_double_click)
+
         # Update headings with totals
         total_articles = len(self.data) if self.data is not None else 0
         if self.current_box is not None:
             total_scanned = sum(self.packages[self.current_box].values())
         else:
             total_scanned = 0
-        total_remaining = sum(self.data.at[art,'quantity'] - self.total_scanned(art) for art in self.data.index) if self.data is not None else 0
+        total_remaining = sum(self.data.at[art,'quantity'] - self.total_scanned(art) 
+                            for art in self.data.index) if self.data is not None else 0
 
         self.tree.heading('article', text=f'Артикул ({total_articles})')
         self.tree.heading('scanned', text=f'В коробке ({total_scanned})')
@@ -260,9 +360,19 @@ class WarehousePacker:
             for idx, (art, qty) in enumerate(self.data['quantity'].items()):
                 scanned = self.packages[self.current_box].get(art, 0)
                 rem = qty - self.total_scanned(art)
-                iid = self.tree.insert('', tk.END, values=(art, scanned, rem))
+                
+                if show_cells:
+                    # Получаем информацию о ячейке
+                    storage_qty, storage_cell = self.storage.get_article_info(art)
+                    cell_info = storage_cell if storage_cell else ""
+                    values = (art, scanned, rem, cell_info)
+                else:
+                    values = (art, scanned, rem)
+                
+                iid = self.tree.insert('', tk.END, values=values)
                 if select_next is None and rem > 0:
                     select_next = iid
+        
         # выделить строку с первым незаполненным
         if select_next is not None:
             self.tree.selection_set(select_next)
@@ -272,14 +382,20 @@ class WarehousePacker:
         # Update label with total remaining for ALL boxes
         self.remaining_label.config(text=f"Всего осталось распределить: {total_remaining}")
 
-    # ... остальные функции (экспорт, ship_wb, ship_ozon) не менялись ...
-
     def export(self):
         rows=[]
         for box,items in self.packages.items():
             for art,cnt in items.items():
                 if cnt>0:
-                    rows.append({'Артикул товара':art,'Кол-во товаров':cnt,'Коробка':box})
+                    row_data = {'Артикул товара':art,'Кол-во товаров':cnt,'Коробка':box}
+                    
+                    # Добавляем информацию о ячейке если доступна
+                    if self.storage and self.storage.enabled:
+                        storage_qty, storage_cell = self.storage.get_article_info(art)
+                        row_data['Ячейка'] = storage_cell if storage_cell else ""
+                    
+                    rows.append(row_data)
+        
         if not rows:
             winsound.Beep(1000,200); messagebox.showwarning("Пусто","Нет данных для экспорта."); return
         df=pd.DataFrame(rows)
@@ -305,12 +421,11 @@ class WarehousePacker:
             winsound.Beep(1000,200)
             messagebox.showerror("Ошибка шаблона", str(e)); return
         boxes = list(self.packages.keys())
-        # if len(tpl) != len(boxes):
-        #     winsound.Beep(1000,200)
-        #     messagebox.showerror("Несоответствие", "Количество строк шаблона не равно количеству коробок"); return
         article_to_gtin = {art:gt for gt,art in self.gtin_map.items()} if self.gtin_map is not None else {}
         out_rows = []
         for idx, box in enumerate(boxes):
+            if idx >= len(tpl):
+                break
             box_code = tpl.at[idx, 'ШК короба']
             shelf_life = tpl.at[idx, 'Срок годности']
             for art, cnt in self.packages[box].items():
@@ -326,11 +441,9 @@ class WarehousePacker:
         save_path = filedialog.asksaveasfilename(defaultextension='.xlsx', title="Сохранить отгрузку WB", filetypes=[('Excel','*.xlsx')])
         if not save_path: return
         try:
-            # write without bold or borders
             df_out.to_excel(save_path, index=False)
             wb = load_workbook(save_path)
             ws = wb.active
-            # remove bold from header and clear borders
             for row in ws.iter_rows(min_row=1, max_row=1):
                 for cell in row:
                     cell.font = Font(bold=False)
@@ -344,53 +457,55 @@ class WarehousePacker:
             messagebox.showerror("Ошибка", f"Не удалось сохранить WB файл:\n{e}")
 
     def ship_ozon(self):
-            if not self.packages:
-                messagebox.showwarning("Пусто", "Нет данных для отгрузки Ozon.")
-                return
-            tpl_path = filedialog.askopenfilename(title="Загрузить шаблон Ozon", filetypes=[('Excel','*.xlsx')])
-            if not tpl_path: return
-            try:
-                tpl = pd.read_excel(tpl_path, dtype=str)
-                required = ['ШК товара','Артикул товара','Кол-во товаров','Зона размещения','ШК ГМ','Тип ГМ (не обязательно)','Срок годности ДО в формате YYYY-MM-DD (не более 1 СГ на 1 SKU в 1 ГМ)']
-                missing = [col for col in required if col not in tpl.columns]
-                if missing:
-                    raise ValueError(f"Шаблон должен содержать колонки: {', '.join(missing)}")
-            except Exception as e:
-                winsound.Beep(1000,200)
-                messagebox.showerror("Ошибка шаблона", str(e))
-                return
-            boxes = list(self.packages.keys())
+        if not self.packages:
+            messagebox.showwarning("Пусто", "Нет данных для отгрузки Ozon.")
+            return
+        tpl_path = filedialog.askopenfilename(title="Загрузить шаблон Ozon", filetypes=[('Excel','*.xlsx')])
+        if not tpl_path: return
+        try:
+            tpl = pd.read_excel(tpl_path, dtype=str)
+            required = ['ШК товара','Артикул товара','Кол-во товаров','Зона размещения','ШК ГМ','Тип ГМ (не обязательно)','Срок годности ДО в формате YYYY-MM-DD (не более 1 СГ на 1 SKU в 1 ГМ)']
+            missing = [col for col in required if col not in tpl.columns]
+            if missing:
+                raise ValueError(f"Шаблон должен содержать колонки: {', '.join(missing)}")
+        except Exception as e:
+            winsound.Beep(1000,200)
+            messagebox.showerror("Ошибка шаблона", str(e))
+            return
+        boxes = list(self.packages.keys())
 
-            article_to_gtin = {art:gt for gt,art in self.gtin_map.items()} if self.gtin_map is not None else {}
-            out_rows = []
-            for idx, box in enumerate(boxes):
-                row = tpl.iloc[idx]
-                sku = row['ШК товара']
-                zone = row['Зона размещения']
-                gm_code = row['ШК ГМ']
-                gm_type = row.get('Тип ГМ', '')
-                shelf = row['Срок годности ДО в формате YYYY-MM-DD (не более 1 СГ на 1 SKU в 1 ГМ)']
-                for art, cnt in self.packages[box].items():
-                    if cnt > 0:
-                        barcode = article_to_gtin.get(art, art)
-                        out_rows.append({
-                            'ШК товара': barcode,
-                            'Артикул товара': art,
-                            'Кол-во товаров': cnt,
-                            'Зона размещения': zone,
-                            'ШК ГМ': gm_code,
-                            'Тип ГМ (не обязательно)': gm_type,
-                            'Срок годности ДО в формате YYYY-MM-DD (не более 1 СГ на 1 SKU в 1 ГМ)': shelf
-                        })
-            df_out = pd.DataFrame(out_rows)
-            save_path = filedialog.asksaveasfilename(defaultextension='.xlsx', title="Сохранить отгрузку Ozon", filetypes=[('Excel','*.xlsx')])
-            if not save_path: return
-            try:
-                df_out.to_excel(save_path, index=False)
-                messagebox.showinfo("Готово", f"Ozon отгрузка сохранена в {os.path.basename(save_path)}")
-            except Exception as e:
-                winsound.Beep(1000,200)
-                messagebox.showerror("Ошибка", f"Не удалось сохранить Ozon файл:\n{e}")
+        article_to_gtin = {art:gt for gt,art in self.gtin_map.items()} if self.gtin_map is not None else {}
+        out_rows = []
+        for idx, box in enumerate(boxes):
+            if idx >= len(tpl):
+                break
+            row = tpl.iloc[idx]
+            sku = row['ШК товара']
+            zone = row['Зона размещения']
+            gm_code = row['ШК ГМ']
+            gm_type = row.get('Тип ГМ', '')
+            shelf = row['Срок годности ДО в формате YYYY-MM-DD (не более 1 СГ на 1 SKU в 1 ГМ)']
+            for art, cnt in self.packages[box].items():
+                if cnt > 0:
+                    barcode = article_to_gtin.get(art, art)
+                    out_rows.append({
+                        'ШК товара': barcode,
+                        'Артикул товара': art,
+                        'Кол-во товаров': cnt,
+                        'Зона размещения': zone,
+                        'ШК ГМ': gm_code,
+                        'Тип ГМ (не обязательно)': gm_type,
+                        'Срок годности ДО в формате YYYY-MM-DD (не более 1 СГ на 1 SKU в 1 ГМ)': shelf
+                    })
+        df_out = pd.DataFrame(out_rows)
+        save_path = filedialog.asksaveasfilename(defaultextension='.xlsx', title="Сохранить отгрузку Ozon", filetypes=[('Excel','*.xlsx')])
+        if not save_path: return
+        try:
+            df_out.to_excel(save_path, index=False)
+            messagebox.showinfo("Готово", f"Ozon отгрузка сохранена в {os.path.basename(save_path)}")
+        except Exception as e:
+            winsound.Beep(1000,200)
+            messagebox.showerror("Ошибка", f"Не удалось сохранить Ozon файл:\n{e}")
 
 if __name__=='__main__':
     root=tk.Tk()
